@@ -1,8 +1,9 @@
 # ==========================================
-# 老陳 AI 交易系統 V20.2 - 自選日子範圍版
-# 1. 新增「結束日期」選擇器，精準鎖定回測區間
-# 2. 保留期權/正股雙模式
-# 3. 保留 IV 拉桿與參數調整
+# 老陳 AI 交易系統 V21.0 - 期權價差策略版
+# 核心升級：
+# 1. 新增 Vertical Spread (垂直價差) 回測
+# 2. Bull Call Spread (看升) / Bear Put Spread (看跌)
+# 3. 自動計算組合單 (Leg 1 - Leg 2) 的淨值變化
 # ==========================================
 
 import streamlit as st
@@ -15,7 +16,7 @@ import io
 from scipy.stats import norm 
 from datetime import datetime
 
-st.set_page_config(page_title="老陳 V20.2 (日期範圍)", layout="wide", page_icon="🗓️")
+st.set_page_config(page_title="老陳 V21.0 (價差策略)", layout="wide", page_icon="🦋")
 
 # --- 1. Black-Scholes 模型 ---
 def black_scholes_price(S, K, T, r, sigma, option_type='call'):
@@ -77,13 +78,10 @@ def generate_signals(df, buy_thresh, sell_thresh):
     df.loc[sell_cond, 'Signal'] = -1
     return df
 
-# --- 5. 回測引擎 (含日期範圍) ---
-def run_backtest(df, initial_capital, start_date, end_date, mode_str, iv_param=0.3):
-    # === 關鍵修改：雙重過濾日期 ===
-    # 確保只選取 Start 到 End 之間的數據
+# --- 5. 回測引擎 (支援價差組合) ---
+def run_backtest(df, initial_capital, start_date, end_date, strategy_type, spread_width_pct, iv_param=0.3):
     mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
     df_test = df.loc[mask].copy()
-    
     if df_test.empty: return 0, 0, pd.DataFrame(), pd.DataFrame()
 
     capital = initial_capital
@@ -91,14 +89,21 @@ def run_backtest(df, initial_capital, start_date, end_date, mode_str, iv_param=0
     trade_log = []
     equity_curve = []
     
-    entry_opt_price = 0
+    # 交易狀態變數
     entry_idx = 0
+    
+    # 單腿模式變數
     strike_price = 0
-    holding_type = None 
+    
+    # 價差模式變數 (Leg 1 = Long, Leg 2 = Short)
+    strike_long = 0
+    strike_short = 0
+    
+    holding_type = None # 'stock', 'long_call', 'long_put', 'bull_spread', 'bear_spread'
     capital_at_entry = 0
     
     r_rate = 0.03
-    is_option_mode = ("Options" in mode_str)
+    days_to_expiry = 30 # 假設都做近月
 
     for i in range(len(df_test)):
         date = df_test.index[i]
@@ -107,64 +112,121 @@ def run_backtest(df, initial_capital, start_date, end_date, mode_str, iv_param=0
         
         current_equity = capital
         
-        # 市值計算
+        # --- 1. 計算持倉市值 (Mark to Market) ---
         if holding_type == 'stock':
             current_equity = position * stock_price
-        elif holding_type in ['call', 'put']:
+            
+        elif holding_type: # 期權相關 (單腿或價差)
             days_held = (i - entry_idx)
-            days_left = 30 - days_held
+            days_left = days_to_expiry - days_held
             if days_left <= 0: days_left = 0.01
             T_year = days_left / 365.0
-            opt_price = black_scholes_price(stock_price, strike_price, T_year, r_rate, iv_param, holding_type)
-            current_equity = position * opt_price
+            
+            # 計算目前價值
+            if holding_type == 'long_call':
+                val = black_scholes_price(stock_price, strike_price, T_year, r_rate, iv_param, 'call')
+                current_equity = position * val
+                
+            elif holding_type == 'long_put':
+                val = black_scholes_price(stock_price, strike_price, T_year, r_rate, iv_param, 'put')
+                current_equity = position * val
+                
+            elif holding_type == 'bull_spread': 
+                # Bull Call Spread = Long ATM Call - Short OTM Call
+                val_long = black_scholes_price(stock_price, strike_long, T_year, r_rate, iv_param, 'call')
+                val_short = black_scholes_price(stock_price, strike_short, T_year, r_rate, iv_param, 'call')
+                spread_val = val_long - val_short # 淨值
+                current_equity = position * spread_val
+                
+            elif holding_type == 'bear_spread':
+                # Bear Put Spread = Long ATM Put - Short OTM Put
+                val_long = black_scholes_price(stock_price, strike_long, T_year, r_rate, iv_param, 'put')
+                val_short = black_scholes_price(stock_price, strike_short, T_year, r_rate, iv_param, 'put')
+                spread_val = val_long - val_short
+                current_equity = position * spread_val
 
         equity_curve.append(current_equity)
 
-        # 交易邏輯
-        # 1. 買入訊號
+        # --- 2. 交易執行邏輯 ---
+        
+        # 定義平倉函數
+        def close_position():
+            nonlocal capital, position, holding_type
+            profit = current_equity - capital_at_entry
+            pct = (profit/capital_at_entry)*100 if capital_at_entry > 0 else 0
+            trade_log[-1].update({'出場日期': date, '出場價(標的)': stock_price, '盈虧 ($)': profit, '報酬率 (%)': pct})
+            capital = current_equity
+            position = 0
+            holding_type = None
+
+        # 訊號 1: 買入 (Bull)
         if signal == 1:
-            if holding_type == 'put': # 平空倉
-                profit = current_equity - capital_at_entry
-                pct = (profit/capital_at_entry)*100
-                trade_log[-1].update({'出場日期': date, '出場價(標的)': stock_price, '盈虧 ($)': profit, '報酬率 (%)': pct})
-                capital = current_equity
-                position = 0
-                holding_type = None
-            
-            if position == 0: # 開多倉
+            # 如果持有空頭部位 (Put / Bear Spread)，先平倉
+            if holding_type in ['long_put', 'bear_spread']:
+                close_position()
+
+            # 開倉 Bull 部位
+            if position == 0:
                 capital_at_entry = capital
-                if not is_option_mode:
+                entry_idx = i
+                
+                if strategy_type == 'Spot (正股)':
                     position = capital / stock_price
                     holding_type = 'stock'
-                    trade_log.append({'進場日期': date, '動作': '買入正股', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
-                else:
+                    trade_log.append({'進場日期': date, '動作': 'Buy Stock', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
+                
+                elif strategy_type == 'Single Option (單腿)':
+                    # Long ATM Call
                     strike_price = stock_price
-                    opt_price = black_scholes_price(stock_price, strike_price, 30/365, r_rate, iv_param, 'call')
-                    position = capital / opt_price
-                    holding_type = 'call'
-                    entry_idx = i
-                    entry_opt_price = opt_price
+                    cost = black_scholes_price(stock_price, strike_price, days_to_expiry/365, r_rate, iv_param, 'call')
+                    position = capital / cost
+                    holding_type = 'long_call'
                     trade_log.append({'進場日期': date, '動作': f'Long Call (K={strike_price:.0f})', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
+                
+                elif strategy_type == 'Spread (價差組合)':
+                    # Bull Call Spread: Long ATM, Short OTM
+                    strike_long = stock_price
+                    strike_short = stock_price * (1 + spread_width_pct/100)
+                    
+                    p_long = black_scholes_price(stock_price, strike_long, days_to_expiry/365, r_rate, iv_param, 'call')
+                    p_short = black_scholes_price(stock_price, strike_short, days_to_expiry/365, r_rate, iv_param, 'call')
+                    
+                    net_debit = p_long - p_short
+                    position = capital / net_debit
+                    holding_type = 'bull_spread'
+                    trade_log.append({'進場日期': date, '動作': f'Bull Spread (L:{strike_long:.0f}/S:{strike_short:.0f})', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
 
-        # 2. 賣出訊號
+        # 訊號 -1: 賣出 (Bear)
         elif signal == -1:
-            if holding_type in ['stock', 'call']: # 平多倉
-                profit = current_equity - capital_at_entry
-                pct = (profit/capital_at_entry)*100
-                trade_log[-1].update({'出場日期': date, '出場價(標的)': stock_price, '盈虧 ($)': profit, '報酬率 (%)': pct})
-                capital = current_equity
-                position = 0
-                holding_type = None
-            
-            if is_option_mode and position == 0: # 開空倉
+            # 如果持有 Bull 部位，先平倉
+            if holding_type in ['stock', 'long_call', 'bull_spread']:
+                close_position()
+
+            # 開倉 Bear 部位 (正股模式不做空，只平倉)
+            if position == 0 and strategy_type != 'Spot (正股)':
                 capital_at_entry = capital
-                strike_price = stock_price
-                opt_price = black_scholes_price(stock_price, strike_price, 30/365, r_rate, iv_param, 'put')
-                position = capital / opt_price
-                holding_type = 'put'
                 entry_idx = i
-                entry_opt_price = opt_price
-                trade_log.append({'進場日期': date, '動作': f'Long Put (K={strike_price:.0f})', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
+                
+                if strategy_type == 'Single Option (單腿)':
+                    # Long ATM Put
+                    strike_price = stock_price
+                    cost = black_scholes_price(stock_price, strike_price, days_to_expiry/365, r_rate, iv_param, 'put')
+                    position = capital / cost
+                    holding_type = 'long_put'
+                    trade_log.append({'進場日期': date, '動作': f'Long Put (K={strike_price:.0f})', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
+                
+                elif strategy_type == 'Spread (價差組合)':
+                    # Bear Put Spread: Long ATM, Short OTM (lower strike)
+                    strike_long = stock_price
+                    strike_short = stock_price * (1 - spread_width_pct/100)
+                    
+                    p_long = black_scholes_price(stock_price, strike_long, days_to_expiry/365, r_rate, iv_param, 'put')
+                    p_short = black_scholes_price(stock_price, strike_short, days_to_expiry/365, r_rate, iv_param, 'put')
+                    
+                    net_debit = p_long - p_short
+                    position = capital / net_debit
+                    holding_type = 'bear_spread'
+                    trade_log.append({'進場日期': date, '動作': f'Bear Spread (L:{strike_long:.0f}/S:{strike_short:.0f})', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
 
     final_val = equity_curve[-1]
     ret = ((final_val - initial_capital) / initial_capital) * 100
@@ -173,28 +235,31 @@ def run_backtest(df, initial_capital, start_date, end_date, mode_str, iv_param=0
 
 # --- 6. 介面 ---
 with st.sidebar:
-    st.header("🎛️ 參數控制 (V20.2)")
+    st.header("🎛️ 參數控制 (V21.0)")
     if st.button("🗑️ 清除快取"): st.cache_data.clear()
     
-    mode = st.radio("模式", ["Spot (正股)", "Options (期權)"], index=1)
+    # === 策略選擇器 ===
+    strat = st.selectbox("交易策略", ["Spot (正股)", "Single Option (單腿)", "Spread (價差組合)"], index=2)
     
-    iv_val = 0.3 
-    if "Options" in mode:
-        st.success("✅ 期權模式 (時間值+IV模擬)")
-        iv_val = st.slider("IV (引伸波幅)", 0.1, 1.0, 0.25, step=0.05)
+    # 期權參數
+    iv_val = 0.3
+    spread_width = 5.0
+    
+    if strat != "Spot (正股)":
+        st.info(f"⚙️ {strat} 參數")
+        iv_val = st.slider("IV (引伸波幅)", 0.1, 1.0, 0.25)
+        
+        if strat == "Spread (價差組合)":
+            spread_width = st.slider("價差闊度 (%)", 1.0, 10.0, 3.0, help="Long Leg 與 Short Leg 的行使價距離")
     
     st.divider()
     
     ticker = st.text_input("代號", value="QQQ").upper()
     initial_cash = st.number_input("本金", value=100000)
     
-    # === 新增：日期範圍選擇 ===
-    st.subheader("🗓️ 選擇回測區間")
     col_d1, col_d2 = st.columns(2)
-    with col_d1:
-        start_date = st.date_input("開始", pd.to_datetime("2023-01-01"))
-    with col_d2:
-        end_date = st.date_input("結束", datetime.today())
+    with col_d1: start_date = st.date_input("開始", pd.to_datetime("2023-01-01"))
+    with col_d2: end_date = st.date_input("結束", datetime.today())
     
     st.divider()
     buy_thresh = st.slider("買入 (J <)", 0, 40, 20)
@@ -202,21 +267,20 @@ with st.sidebar:
     
     run_btn = st.button("🚀 執行回測", type="primary")
 
-st.title(f"🗓️ V20.2 - {mode.split()[0]} 日子範圍版")
+st.title(f"🦋 V21.0 - {strat} 回測")
 
 if run_btn:
     if start_date > end_date:
-        st.error("⚠️ 錯誤：開始日期不能晚於結束日期！")
+        st.error("日期錯誤")
     else:
-        with st.spinner("計算中..."):
+        with st.spinner("模擬價差策略中..."):
             df_raw, real_sym = get_stooq_data(ticker)
             
             if df_raw is not None and not df_raw.empty:
                 df = calculate_indicators(df_raw)
                 df = generate_signals(df, buy_thresh, sell_thresh)
                 
-                # 傳入 end_date
-                final_val, ret, df_log, df_chart = run_backtest(df, initial_cash, start_date, end_date, mode, iv_val)
+                final_val, ret, df_log, df_chart = run_backtest(df, initial_cash, start_date, end_date, strat, spread_width, iv_val)
                 
                 if not df_chart.empty:
                     c1, c2, c3 = st.columns(3)
@@ -233,7 +297,7 @@ if run_btn:
                     
                     st.subheader("資產走勢")
                     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4])
-                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], fill='tozeroy', line=dict(color='#00ff00' if 'Spot' in mode else '#ffaa00'), name='資產'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], fill='tozeroy', line=dict(color='#00ff00' if strat=='Spot (正股)' else '#ffaa00'), name='資產'), row=1, col=1)
                     fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['J'], line=dict(color='#ab63fa'), name='J線'), row=2, col=1)
                     fig.add_hline(y=buy_thresh, line_dash="dot", row=2, col=1, line_color="green")
                     fig.add_hline(y=sell_thresh, line_dash="dot", row=2, col=1, line_color="red")
@@ -250,4 +314,4 @@ if run_btn:
                             return 'color: lightgreen' if val > 0 else 'color: #ff5555'
                         st.dataframe(disp.style.format({"進場價(標的)": "{:.2f}", "出場價(標的)": "{:.2f}", "盈虧 ($)": "{:+.2f}", "報酬率 (%)": "{:+.2f}%"}).map(color_row, subset=['盈虧 ($)', '報酬率 (%)']), use_container_width=True)
             else:
-                st.warning(f"在 {start_date} 到 {end_date} 之間沒有數據。")
+                st.warning("無數據")
