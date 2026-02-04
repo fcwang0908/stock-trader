@@ -1,8 +1,7 @@
 streamlit
 pandas
 numpy
-scipy
 plotly
-openpyxl
 requests
-lxml
+scipy
+openpyxl
