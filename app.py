@@ -1,7 +1,8 @@
 # ==========================================
-# 老陳 AI 交易系統 V19.6 - 強制刷新版
-# 1. 新增「清除快取」按鈕，解決舊數據卡住的問題
-# 2. 優化美股判斷邏輯 (確保 QQQ -> QQQ.US)
+# 老陳 AI 交易系統 V19.7 - 期貨代號對應版
+# 1. 新增期貨代號支援：輸入 MHI 自動轉 2800.HK
+# 2. 輸入 HHI (國指) 自動轉 2828.HK
+# 3. 避免誤判為美股
 # ==========================================
 
 import streamlit as st
@@ -12,30 +13,38 @@ from plotly.subplots import make_subplots
 import requests
 import io
 
-# 網站設定
-st.set_page_config(page_title="老陳回測系統 V19.6", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="老陳回測系統 V19.7", layout="wide", page_icon="🇭🇰")
 
-# --- 1. 數據獲取 (V19.6 優化版) ---
+# --- 1. 數據獲取 (V19.7 智能對應) ---
 @st.cache_data(ttl=3600)
 def get_stooq_data(symbol):
     # 轉大寫 + 去空白
-    clean_sym = symbol.upper().strip()
+    raw_sym = symbol.upper().strip()
+    clean_sym = raw_sym # 預設值
     
-    # === 邏輯判斷區 ===
+    # === 智能導向系統 ===
     
-    # 1. 恆指特殊處理
-    if clean_sym in ["HSI", "HSI.HK", "^HSI"]: 
+    # 1. 恆指系列 (HSI, MHI 小期) -> 轉盈富 (2800.HK)
+    # Stooq 沒有連續期貨數據，用 2800 是最佳替代品，走勢同步
+    if raw_sym in ["HSI", "^HSI", "MHI", "HK50"]: 
         clean_sym = "2800.HK"
-    
-    # 2. 港股 (純數字) -> 去掉前導零，加 .HK
-    elif clean_sym.isdigit(): 
-        clean_sym = f"{int(clean_sym)}.HK"
         
-    # 3. 美股 (純字母 且 沒有點) -> 加 .US
-    # 例子: "QQQ" -> "QQQ.US"
-    # 例子: "QQQ.US" -> 保持不變 (因為有點)
-    elif clean_sym.isalpha() and "." not in clean_sym:
-        clean_sym = f"{clean_sym}.US"
+    # 2. 國指系列 (HHI, MCH 小國期) -> 轉恆生中國企業 (2828.HK)
+    elif raw_sym in ["HHI", "^HHI", "MCH"]:
+        clean_sym = "2828.HK"
+        
+    # 3. 科技指數 (HSTECH, ATMX) -> 轉南方恆生科技 (3033.HK)
+    elif raw_sym in ["HSTECH", "ATMX"]:
+        clean_sym = "3033.HK"
+
+    # 4. 港股 (純數字) -> 去前導零 + 加 .HK
+    elif raw_sym.isdigit(): 
+        clean_sym = f"{int(raw_sym)}.HK"
+        
+    # 5. 美股 (純字母) -> 加 .US
+    # 必須排除上面的 MHI, HHI 等關鍵字，否則會變 MHI.US
+    elif raw_sym.isalpha() and "." not in raw_sym:
+        clean_sym = f"{raw_sym}.US"
         
     # 下載連結
     url = f"https://stooq.com/q/d/l/?s={clean_sym}&i=d"
@@ -49,7 +58,6 @@ def get_stooq_data(symbol):
             
         file_content = response.content.decode('utf-8')
         
-        # 檢查無效數據
         if "No data" in file_content or len(file_content) < 50:
              return None, clean_sym
 
@@ -133,25 +141,24 @@ def run_backtest(df, initial_capital, start_date):
 
 # --- 5. 網站介面 ---
 with st.sidebar:
-    st.header("⚙️ 回測設定 (V19.6)")
+    st.header("⚙️ 回測設定 (V19.7)")
     
-    # 🔥 新增清除快取按鈕
-    if st.button("🗑️ 清除數據快取 (如果報錯請按我)"):
+    if st.button("🗑️ 清除快取"):
         st.cache_data.clear()
-        st.success("快取已清除！請重新點擊開始回測。")
     
     st.divider()
     
-    ticker = st.text_input("股票代號 (QQQ, 700)", value="QQQ").upper()
+    # 預設改為 MHI 讓你試試
+    ticker = st.text_input("代號 (MHI, HHI, 700)", value="MHI").upper()
     start_date = st.date_input("開始日期", pd.to_datetime("2023-01-01"))
     initial_cash = st.number_input("初始本金 ($)", value=100000)
     run_btn = st.button("🚀 開始回測", type="primary")
 
-st.title("🛡️ 老陳回測系統 V19.6")
-st.caption("✅ QQQ 修復版 (請先按左側 '清除快取' 以確保生效)")
+st.title("🇭🇰 老陳回測系統 V19.7")
+st.caption("✅ 支援期貨代號 (MHI -> 2800, HHI -> 2828)")
 
 if run_btn:
-    with st.spinner(f"正在分析 {ticker}..."):
+    with st.spinner(f"正在分析 {ticker} (已自動對應至相關 ETF)..."):
         df_raw, real_sym = get_stooq_data(ticker)
         
         if df_raw is not None and not df_raw.empty:
@@ -161,7 +168,15 @@ if run_btn:
             
             if not df_chart.empty:
                 c1, c2, c3 = st.columns(3)
-                c1.metric("回測標的", real_sym) 
+                
+                # 顯示這是「替身」數據
+                if ticker == "MHI":
+                    c1.metric("回測標的", "MHI (以2800計算)")
+                elif ticker == "HHI":
+                    c1.metric("回測標的", "HHI (以2828計算)")
+                else:
+                    c1.metric("回測標的", real_sym) 
+                    
                 c2.metric("最終資產", f"${final_val:,.0f}", f"{ret:+.2f}%")
                 
                 win_rate = 0
@@ -199,4 +214,3 @@ if run_btn:
                 st.warning("選定的日期範圍內沒有數據。")
         else:
             st.error(f"❌ 無法下載 {ticker}。")
-            st.info("💡 請嘗試點擊左側的「🗑️ 清除數據快取」按鈕，然後再試一次。")
