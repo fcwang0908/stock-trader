@@ -6,4 +6,3 @@ plotly
 openpyxl
 requests
 lxml
-pandas-datareader
