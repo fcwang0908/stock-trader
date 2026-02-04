@@ -1,8 +1,8 @@
 # ==========================================
-# 老陳 AI 交易系統 V24.1 - 顯示錯誤修復版
-# 修復內容：
-# 1. 解決 st.dataframe 格式化 None 值時的崩潰問題
-# 2. 優化交易紀錄顯示，未平倉單會顯示 "-" 而非報錯
+# 老陳 AI 交易系統 V24.2 - 安全啟動版
+# 修復重點：
+# 1. 加入 Scipy 檢測機制 (防止因缺庫導致白屏)
+# 2. 確保 st.set_page_config 在最第一行
 # ==========================================
 
 import streamlit as st
@@ -12,10 +12,18 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import io
-from scipy.stats import norm 
 from datetime import datetime
 
-st.set_page_config(page_title="老陳 V24.1 (修復版)", layout="wide", page_icon="🦋")
+# 1. 頁面設定 (必須在所有指令之前)
+st.set_page_config(page_title="老陳 V24.2 (安全版)", layout="wide", page_icon="🛡️")
+
+# 2. 安全引入 Scipy
+try:
+    from scipy.stats import norm
+except ImportError:
+    st.error("🚨 嚴重錯誤：找不到 `scipy` 庫！")
+    st.warning("請在 GitHub 的 `requirements.txt` 文件中加入一行：`scipy`，然後重啟 App。")
+    st.stop() # 停止執行，避免崩潰
 
 # --- 0. 全局設定 ---
 PRESETS = {
@@ -126,3 +134,108 @@ def render_strategy_lab(df, real_sym):
         if last['J'] < 20:
             st.success("🚀 看升 (Bullish)")
             st.markdown(f"**Bull Call Spread** (牛市價差)\n* Buy Call @ {last['Close']:.1f}\n* Sell Call @ {last['Close']*1.05:.1f}")
+        elif last['J'] > 80:
+            st.error("📉 看跌 (Bearish)")
+            st.markdown(f"**Bear Put Spread** (熊市價差)\n* Buy Put @ {last['Close']:.1f}\n* Sell Put @ {last['Close']*0.95:.1f}")
+        else:
+            st.warning("觀望")
+    with c2:
+        st.subheader("盤整策略")
+        st.write("Iron Condor (鐵兀鷹) - 適合 J 線在 20-80 之間震盪時")
+
+# --- 3. 高階回測引擎 ---
+def run_advanced_backtest(df, initial_capital, start_date, end_date, 
+                          mode_str, opt_strat, spread_width_pct,
+                          size_type, fixed_amt, iv_param=0.3):
+    
+    mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
+    df_test = df.loc[mask].copy()
+    if df_test.empty: return 0, 0, pd.DataFrame(), pd.DataFrame()
+
+    capital = initial_capital
+    position = 0
+    trade_log = []
+    equity_curve = []
+    
+    # 交易狀態
+    entry_idx = 0
+    invested_amount = 0
+    holding_type = None 
+    
+    strike_long = 0
+    strike_short = 0
+    
+    r_rate = 0.03
+    is_option_mode = ("Options" in mode_str)
+
+    def calc_position_size(unit_cost):
+        if size_type == "全倉 (All-in)": return capital
+        else: return min(capital, fixed_amt)
+
+    for i in range(len(df_test)):
+        date = df_test.index[i]
+        stock_price = df_test['Close'].iloc[i]
+        signal = df_test['Signal'].iloc[i]
+        
+        current_equity = capital
+        
+        # --- 1. 市值計算 (Mark to Market) ---
+        if holding_type == 'stock':
+            current_equity = (capital - invested_amount) + (position * stock_price)
+            
+        elif holding_type: # 期權類
+            days_held = (i - entry_idx)
+            days_left = max(0.01, 30 - days_held)
+            T_yr = days_left / 365.0
+            
+            unit_val = 0
+            if holding_type == 'long_call':
+                unit_val = black_scholes_price(stock_price, strike_long, T_yr, r_rate, iv_param, 'call')
+            elif holding_type == 'long_put':
+                unit_val = black_scholes_price(stock_price, strike_long, T_yr, r_rate, iv_param, 'put')
+            elif holding_type == 'bull_spread':
+                val_L = black_scholes_price(stock_price, strike_long, T_yr, r_rate, iv_param, 'call')
+                val_S = black_scholes_price(stock_price, strike_short, T_yr, r_rate, iv_param, 'call')
+                unit_val = val_L - val_S
+            elif holding_type == 'bear_spread':
+                val_L = black_scholes_price(stock_price, strike_long, T_yr, r_rate, iv_param, 'put')
+                val_S = black_scholes_price(stock_price, strike_short, T_yr, r_rate, iv_param, 'put')
+                unit_val = val_L - val_S
+            
+            current_equity = (capital - invested_amount) + (position * unit_val)
+
+        equity_curve.append(current_equity)
+
+        # --- 2. 交易執行 ---
+        def close_pos():
+            nonlocal capital, position, holding_type
+            cash_back = current_equity - (capital - invested_amount)
+            profit = cash_back - invested_amount
+            # 這裡不更新 trade_log，讓外層更新，避免重複
+            return profit
+
+        if signal == 1: # Buy Signal
+            if holding_type in ['long_put', 'bear_spread']: 
+                profit = close_pos()
+                trade_log[-1].update({'出場日期': date, '出場價': stock_price, '盈虧': profit, '回報%': (profit/invested_amount)*100})
+                capital = current_equity; position = 0; holding_type = None
+
+            if position == 0:
+                if not is_option_mode: # 正股
+                    amt = calc_position_size(stock_price)
+                    if amt > 0:
+                        position = amt / stock_price
+                        invested_amount = amt
+                        holding_type = 'stock'
+                        trade_log.append({'進場日期': date, '動作': 'Buy Stock', '投入': amt, '進場價': stock_price, '出場日期': None, '出場價': None, '盈虧': None, '回報%': None})
+                else: # 期權
+                    entry_idx = i
+                    if opt_strat == "Single (單腿)":
+                        strike_long = stock_price
+                        cost = black_scholes_price(stock_price, strike_long, 30/365, r_rate, iv_param, 'call')
+                        amt = calc_position_size(cost)
+                        if amt > 0:
+                            position = amt / cost
+                            invested_amount = amt
+                            holding_type = 'long_call'
+                            trade_log.append({'進場日期': date, '動作': f'Long Call ({strike_long:.0f})', '投入': amt, '進場價': stock_price, '出場日期': None, '出場價': None, '盈虧': None, '回報%
