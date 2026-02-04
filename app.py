@@ -1,183 +1,208 @@
 # ==========================================
-# 老陳 AI 交易系統 V15.5 - 終極離線/上傳版
-# 解決方案：當 Yahoo 封鎖 IP 時，允許用戶「手動上傳 CSV」進行分析
+# 老陳 AI 交易系統 V19.1 - Stooq 回測專用版
+# 核心：使用 Stooq 數據源進行歷史策略回測
+# 策略：AO + J線 (低買高賣)
 # ==========================================
 
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import io
+import pandas_datareader.data as web
+from datetime import datetime
 
-st.set_page_config(page_title="老陳 V15.5 (終極版)", layout="wide", page_icon="📂")
+st.set_page_config(page_title="老陳回測系統 (Stooq)", layout="wide", page_icon="🧪")
 
-# --- 0. 智能代號修正 ---
-def smart_symbol(symbol):
-    s = symbol.upper().strip()
-    if s.isdigit(): return f"{s.zfill(4)}.HK"
-    if s in ["HSI", "HSI.HK"]: return "^HSI"
-    return s
-
-# --- 1. 核心數據處理 (支援 CSV 上傳) ---
-def process_data(df):
-    # 確保索引是日期格式
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            # 嘗試把 'Date' 欄位變成索引 (針對 CSV)
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
-                df.set_index('Date', inplace=True)
-            else:
-                # 嘗試把 index 轉日期
-                df.index = pd.to_datetime(df.index)
-        except:
-            return None
-
-    # 移除時區
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-
-    # 確保數值正確
-    cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
+# --- 1. 數據獲取 (Stooq 引擎) ---
+@st.cache_data(ttl=3600)
+def get_stooq_data(symbol, start_date):
+    clean_sym = symbol.upper().strip()
     
-    # === 指標計算 ===
+    # 智能修正代號 (配合 Stooq 格式)
+    if clean_sym.isdigit(): 
+        clean_sym = f"{clean_sym}.HK"
+    if clean_sym in ["HSI", "HSI.HK"]: 
+        clean_sym = "^HSI"
+        
+    try:
+        # 下載數據
+        df = web.DataReader(clean_sym, 'stooq', start=start_date)
+        
+        # ⚠️ 關鍵：Stooq 預設是 [新 -> 舊]，回測必須要 [舊 -> 新]
+        df = df.sort_index()
+        
+        # 轉為數值
+        df = df.apply(pd.to_numeric, errors='coerce')
+        
+        return df, clean_sym
+    except Exception as e:
+        # 替身機制：恆指失敗轉盈富
+        if clean_sym == "^HSI":
+             return get_stooq_data("2800", start_date)
+        return None, clean_sym
+
+# --- 2. 指標計算 ---
+def calculate_indicators(df):
+    # MA
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA60'] = df['Close'].rolling(window=60).mean()
-    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
-    df['Vol_Ratio'] = np.where(df['Vol_MA20']>0, df['Volume']/df['Vol_MA20'], 0)
+    df['MA60'] = df['Close'].rolling(window=60).mean() # 牛熊線
+    
+    # AO 指標 (Awesome Oscillator)
+    # MP = (High + Low) / 2
+    df['MP'] = (df['High'] + df['Low']) / 2
+    df['AO'] = df['MP'].rolling(5).mean() - df['MP'].rolling(34).mean()
 
-    # MFI
-    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    money_flow = typical_price * df['Volume']
-    pos_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
-    neg_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0)
-    pos_mf = pd.Series(pos_flow).rolling(14).sum()
-    neg_mf = pd.Series(neg_flow).rolling(14).sum()
-    mfi_ratio = np.divide(pos_mf, neg_mf, out=np.zeros_like(pos_mf), where=neg_mf!=0)
-    df['MFI'] = 100 - (100 / (1 + mfi_ratio))
-    df['MFI'].index = df.index
-
-    # KDJ
+    # KDJ 指標
     low_9 = df['Low'].rolling(9).min()
     high_9 = df['High'].rolling(9).max()
     rsv = (df['Close'] - low_9) / (high_9 - low_9) * 100
     df['K'] = rsv.ewm(com=2).mean()
     df['D'] = df['K'].ewm(com=2).mean()
     df['J'] = 3 * df['K'] - 2 * df['D']
-
-    return df.dropna()
-
-# 獲取數據入口
-def get_data_v15(symbol, uploaded_file):
-    # 優先處理上傳的檔案
-    if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-            return process_data(df), "📄 上傳的檔案"
-        except Exception as e:
-            st.error(f"檔案讀取失敗: {e}")
-            return None, symbol
-
-    # 其次嘗試 Yahoo 下載
-    clean_sym = smart_symbol(symbol)
-    try:
-        # 嘗試多種格式 (暴力測試)
-        variants = [clean_sym]
-        if ".HK" in clean_sym: variants.append(clean_sym.replace(".HK", "")) # 試試 700
-        
-        for sym in variants:
-            ticker = yf.Ticker(sym)
-            df = ticker.history(period='1y', interval='1d')
-            if not df.empty:
-                return process_data(df), sym
-        
-        return None, clean_sym
-    except:
-        return None, clean_sym
-
-def analyze_logic(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    score = 0; signals = []
     
-    if last['MFI'] > 80: score -= 2; signals.append("💰 MFI 超買 (>80)")
-    elif last['MFI'] < 20: score += 2; signals.append("💰 MFI 超賣 (<20)")
+    return df
+
+# --- 3. 產生訊號 (策略大腦) ---
+def generate_signals(df):
+    df['Signal'] = 0 # 0=無動作, 1=買入, -1=賣出
     
-    if last['Vol_Ratio'] > 2.0:
-        if last['Close'] > last['Open']: score += 1; signals.append("🔥 爆量長陽")
-        else: score -= 1; signals.append("💀 爆量長陰")
-        
-    if last['J'] < 10 and last['J'] > prev['J']: score += 1; signals.append("⚡ J線低位勾頭")
-    if last['Close'] > last['MA20']: score += 1
+    # 買入條件：J線低位(<20) 且 向上勾頭 (J > 昨日J)
+    buy_cond = (df['J'] < 20) & (df['J'] > df['J'].shift(1))
     
-    return score, signals
+    # 賣出條件：J線高位(>80) 且 向下勾頭 (J < 昨日J)
+    sell_cond = (df['J'] > 80) & (df['J'] < df['J'].shift(1))
+    
+    df.loc[buy_cond, 'Signal'] = 1
+    df.loc[sell_cond, 'Signal'] = -1
+    
+    return df
 
-# --- 2. 介面 ---
-st.title("💰 老陳 AI - V15.5 (終極數據版)")
-
-# 側邊欄：手動上傳
-with st.sidebar:
-    st.header("📂 數據備用通道")
-    st.info("如果 Yahoo 封鎖連線，請在此上傳 CSV。")
-    uploaded_file = st.file_uploader("上傳歷史數據 (CSV)", type=['csv'])
-    st.markdown("[👉 按此去 Yahoo 下載 CSV](https://finance.yahoo.com/quote/0700.HK/history)")
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    user_input = st.text_input("股票代號 (700, TSLA)", value="700").upper()
-with col2:
-    if st.button("刷新"): st.rerun()
-
-# 獲取數據
-df, real_sym = get_data_v15(user_input, uploaded_file)
-
-if df is not None and not df.empty and len(df) >= 2:
-    try:
-        last = df.iloc[-1]
-        change = last['Close'] - df.iloc[-2]['Close']
+# --- 4. 回測引擎 (計算盈虧) ---
+def run_backtest(df, initial_capital):
+    capital = initial_capital
+    position = 0 # 持股數 (0=空倉)
+    history = []
+    equity_curve = [] # 資產曲線
+    
+    for i in range(1, len(df)):
+        date = df.index[i]
+        price = df['Close'].iloc[i]
+        signal = df['Signal'].iloc[i]
         
-        st.success(f"✅ 成功獲取數據源: {real_sym}")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("現價", f"{last['Close']:,.2f}", f"{change:+.2f}")
-        c2.metric("成交量", f"{last['Volume']/1e6:.1f}M", f"x{last['Vol_Ratio']:.1f}倍")
-        c3.metric("MFI", f"{last['MFI']:.1f}")
-        c4.metric("J線", f"{last['J']:.1f}")
-
-        score, signals = analyze_logic(df)
-        
-        st.markdown("---")
-        if score >= 4: st.success("🚀 強力買入")
-        elif score <= -3: st.error("💥 強力賣出")
-        elif score > 0: st.info("👀 偏好")
-        else: st.warning("👀 偏淡")
+        # 執行買入 (有訊號 且 空倉時)
+        if signal == 1 and position == 0:
+            position = capital / price # 全倉買入
+            capital = 0
+            history.append({'Date': date, 'Type': 'BUY', 'Price': price, 'Balance': position*price})
             
-        with st.expander("訊號詳情"):
-            for s in signals: st.write(s)
+        # 執行賣出 (有訊號 且 持倉時)
+        elif signal == -1 and position > 0:
+            capital = position * price # 全倉賣出
+            position = 0
+            history.append({'Date': date, 'Type': 'SELL', 'Price': price, 'Balance': capital})
+        
+        # 每日結算資產價值
+        current_val = capital if position == 0 else position * price
+        equity_curve.append(current_val)
+            
+    # 最後一天強制平倉
+    final_value = capital if position == 0 else position * df['Close'].iloc[-1]
+    ret = ((final_value - initial_capital) / initial_capital) * 100
+    
+    # 補齊 equity curve 長度以便畫圖
+    df_chart = df.iloc[1:].copy()
+    df_chart['Equity'] = equity_curve
+    
+    return final_value, ret, pd.DataFrame(history), df_chart
 
-        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.4, 0.2, 0.2, 0.2], subplot_titles=('價格', '成交量', 'MFI', 'J線'))
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange', width=1), name='MA20'), row=1, col=1)
-        colors_vol = ['#00cc96' if c >= o else '#ef553b' for c, o in zip(df['Close'], df['Open'])]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors_vol, name='Vol'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MFI'], line=dict(color='#00bfff', width=2), name='MFI'), row=3, col=1)
-        fig.add_hline(y=80, line_dash="dot", row=3, col=1, line_color="red"); fig.add_hline(y=20, line_dash="dot", row=3, col=1, line_color="green")
-        fig.add_trace(go.Scatter(x=df.index, y=df['J'], line=dict(color='#ab63fa', width=2), name='J線'), row=4, col=1)
-        fig.add_hline(y=100, line_dash="dot", row=4, col=1, line_color="red"); fig.add_hline(y=0, line_dash="dot", row=4, col=1, line_color="green")
-        fig.update_layout(height=1000, xaxis_rangeslider_visible=False, showlegend=False, template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
+# --- 5. 網站介面 ---
+with st.sidebar:
+    st.header("⚙️ 回測設定 (Stooq)")
+    ticker = st.text_input("股票代號", value="2800").upper()
+    start_date = st.date_input("開始日期", pd.to_datetime("2023-01-01"))
+    initial_cash = st.number_input("初始本金 ($)", value=100000)
+    st.info("策略：J線 < 20 買入，J線 > 80 賣出")
+    run_btn = st.button("🚀 開始回測", type="primary")
 
-    except Exception as e:
-        st.error(f"分析錯誤: {e}")
+st.title("🧪 老陳回測系統 V19.1")
+st.caption("數據源：Stooq (穩定不封鎖) | 策略：AO + J線反轉")
+
+if run_btn:
+    with st.spinner(f"正在從波蘭 Stooq 下載 {ticker} 數據..."):
+        df_raw, real_sym = get_stooq_data(ticker, start_date)
+        
+        if df_raw is not None and not df_raw.empty:
+            # 1. 計算
+            df = calculate_indicators(df_raw)
+            df = generate_signals(df)
+            final_val, ret, trade_log, df_chart = run_backtest(df, initial_cash)
+            
+            # 2. 顯示績效
+            c1, c2, c3 = st.columns(3)
+            c1.metric("回測標的", real_sym)
+            
+            color = "normal"
+            if ret > 0: color = "normal" # 綠色/正常
+            else: color = "inverse" # 紅色 (Streamlit logic)
+            
+            c2.metric("最終資產", f"${final_val:,.0f}", f"{ret:+.2f}%")
+            
+            # 計算勝率
+            win_rate = 0
+            if not trade_log.empty:
+                sells = trade_log[trade_log['Type']=='SELL']
+                wins = 0
+                for idx, row in sells.iterrows():
+                    # 找對應的買入價
+                    # 這裡簡化邏輯，假設賣出一定對應最近一次買入
+                    # 實際應更嚴謹，但展示足夠了
+                    prev_buy = trade_log[(trade_log.index < idx) & (trade_log['Type']=='BUY')]
+                    if not prev_buy.empty:
+                         if row['Price'] > prev_buy.iloc[-1]['Price']: wins += 1
+                if len(sells) > 0:
+                    win_rate = (wins / len(sells)) * 100
+            
+            c3.metric("交易勝率", f"{win_rate:.1f}%", f"共 {len(trade_log)//2} 次交易")
+            
+            # 3. 畫圖 (三層)
+            st.subheader("📊 回測結果可視化")
+            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                                row_heights=[0.5, 0.25, 0.25],
+                                subplot_titles=('價格 & 買賣點', '資產增長曲線 (Equity Curve)', 'KDJ 指標'))
+            
+            # 圖1: K線 + 買賣點
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='blue', width=1), name='牛熊線'), row=1, col=1)
+            
+            # 標記買點
+            buys = df[df['Signal'] == 1]
+            fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.98, mode='markers', marker=dict(symbol='triangle-up', size=12, color='yellow'), name='買入'), row=1, col=1)
+            # 標記賣點
+            sells = df[df['Signal'] == -1]
+            fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.02, mode='markers', marker=dict(symbol='triangle-down', size=12, color='magenta'), name='賣出'), row=1, col=1)
+
+            # 圖2: 資產曲線
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], fill='tozeroy', line=dict(color='#00ff00'), name='總資產'), row=2, col=1)
+            
+            # 圖3: J線
+            fig.add_trace(go.Scatter(x=df.index, y=df['J'], line=dict(color='#ab63fa', width=2), name='J線'), row=3, col=1)
+            fig.add_hline(y=20, line_dash="dot", row=3, col=1, line_color="green")
+            fig.add_hline(y=80, line_dash="dot", row=3, col=1, line_color="red")
+            
+            fig.update_layout(height=800, template="plotly_dark", showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 4. 交易明細
+            with st.expander("查看詳細交易紀錄"):
+                if not trade_log.empty:
+                    st.dataframe(trade_log.style.format({"Price": "{:.2f}", "Balance": "{:.2f}"}))
+                else:
+                    st.write("這段時間內沒有觸發任何交易。")
+
+        else:
+            st.error(f"找不到 {ticker} 的數據。")
+            st.info("💡 提示：港股請輸入數字 (如 700)，美股輸入代號 (如 TSLA)。")
+
 else:
-    st.error(f"❌ 依然無法自動下載 {user_input}。Yahoo 封鎖了雲端 IP。")
-    st.info("💡 **終極解決辦法：**")
-    st.markdown("1. 點擊這裡下載數據：[Yahoo Finance 0700.HK](https://finance.yahoo.com/quote/0700.HK/history)")
-    st.markdown("2. 點擊 Yahoo 頁面中間的 **'Download'** 下載 `.csv` 檔案。")
-    st.markdown("3. 打開左側選單 ( > )，把檔案拖進 **'上傳歷史數據'** 框框。")
-    st.markdown("4. 你的 AI 分析圖就會立刻出現！")
+    st.info("👈 請在左側輸入代號，例如 2800，然後按開始。")
