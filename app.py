@@ -1,7 +1,8 @@
 # ==========================================
-# 老陳 AI 交易系統 V20.1 - IV 拉桿修復版
-# 1. 修復側邊欄邏輯，確保選擇「期權」時能看到 IV 設定
-# 2. 引入 Black-Scholes 模型模擬期權價格
+# 老陳 AI 交易系統 V20.2 - 自選日子範圍版
+# 1. 新增「結束日期」選擇器，精準鎖定回測區間
+# 2. 保留期權/正股雙模式
+# 3. 保留 IV 拉桿與參數調整
 # ==========================================
 
 import streamlit as st
@@ -12,8 +13,9 @@ from plotly.subplots import make_subplots
 import requests
 import io
 from scipy.stats import norm 
+from datetime import datetime
 
-st.set_page_config(page_title="老陳 V20.1 (期權修復)", layout="wide", page_icon="🔧")
+st.set_page_config(page_title="老陳 V20.2 (日期範圍)", layout="wide", page_icon="🗓️")
 
 # --- 1. Black-Scholes 模型 ---
 def black_scholes_price(S, K, T, r, sigma, option_type='call'):
@@ -75,10 +77,13 @@ def generate_signals(df, buy_thresh, sell_thresh):
     df.loc[sell_cond, 'Signal'] = -1
     return df
 
-# --- 5. 回測引擎 ---
-def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
-    mask = df.index >= pd.to_datetime(start_date)
+# --- 5. 回測引擎 (含日期範圍) ---
+def run_backtest(df, initial_capital, start_date, end_date, mode_str, iv_param=0.3):
+    # === 關鍵修改：雙重過濾日期 ===
+    # 確保只選取 Start 到 End 之間的數據
+    mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
     df_test = df.loc[mask].copy()
+    
     if df_test.empty: return 0, 0, pd.DataFrame(), pd.DataFrame()
 
     capital = initial_capital
@@ -90,11 +95,9 @@ def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
     entry_idx = 0
     strike_price = 0
     holding_type = None 
-    capital_at_entry = 0 # 記錄開倉時的資金，算報酬率用
+    capital_at_entry = 0
     
     r_rate = 0.03
-    
-    # 判斷是正股還是期權
     is_option_mode = ("Options" in mode_str)
 
     for i in range(len(df_test)):
@@ -104,27 +107,23 @@ def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
         
         current_equity = capital
         
-        # --- 市值更新 ---
+        # 市值計算
         if holding_type == 'stock':
             current_equity = position * stock_price
-            
         elif holding_type in ['call', 'put']:
             days_held = (i - entry_idx)
             days_left = 30 - days_held
             if days_left <= 0: days_left = 0.01
             T_year = days_left / 365.0
-            
             opt_price = black_scholes_price(stock_price, strike_price, T_year, r_rate, iv_param, holding_type)
-            # 這裡簡單假設 position 是持有的「份數」，權益 = 份數 * 單價
             current_equity = position * opt_price
 
         equity_curve.append(current_equity)
 
-        # --- 交易執行 ---
+        # 交易邏輯
         # 1. 買入訊號
         if signal == 1:
-            # 若持有 Put，平倉
-            if holding_type == 'put':
+            if holding_type == 'put': # 平空倉
                 profit = current_equity - capital_at_entry
                 pct = (profit/capital_at_entry)*100
                 trade_log[-1].update({'出場日期': date, '出場價(標的)': stock_price, '盈虧 ($)': profit, '報酬率 (%)': pct})
@@ -132,14 +131,13 @@ def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
                 position = 0
                 holding_type = None
             
-            # 開倉 (正股 或 Call)
-            if position == 0:
+            if position == 0: # 開多倉
                 capital_at_entry = capital
-                if not is_option_mode: # 正股
+                if not is_option_mode:
                     position = capital / stock_price
                     holding_type = 'stock'
                     trade_log.append({'進場日期': date, '動作': '買入正股', '進場價(標的)': stock_price, '出場日期': None, '盈虧 ($)': None, '報酬率 (%)': None})
-                else: # Call
+                else:
                     strike_price = stock_price
                     opt_price = black_scholes_price(stock_price, strike_price, 30/365, r_rate, iv_param, 'call')
                     position = capital / opt_price
@@ -150,8 +148,7 @@ def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
 
         # 2. 賣出訊號
         elif signal == -1:
-            # 若持有 正股 或 Call，平倉
-            if holding_type in ['stock', 'call']:
+            if holding_type in ['stock', 'call']: # 平多倉
                 profit = current_equity - capital_at_entry
                 pct = (profit/capital_at_entry)*100
                 trade_log[-1].update({'出場日期': date, '出場價(標的)': stock_price, '盈虧 ($)': profit, '報酬率 (%)': pct})
@@ -159,8 +156,7 @@ def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
                 position = 0
                 holding_type = None
             
-            # 開倉 (Put) - 僅限期權模式
-            if is_option_mode and position == 0:
+            if is_option_mode and position == 0: # 開空倉
                 capital_at_entry = capital
                 strike_price = stock_price
                 opt_price = black_scholes_price(stock_price, strike_price, 30/365, r_rate, iv_param, 'put')
@@ -177,74 +173,81 @@ def run_backtest(df, initial_capital, start_date, mode_str, iv_param=0.3):
 
 # --- 6. 介面 ---
 with st.sidebar:
-    st.header("🎛️ 參數控制 (V20.1)")
+    st.header("🎛️ 參數控制 (V20.2)")
     if st.button("🗑️ 清除快取"): st.cache_data.clear()
     
-    # === 修復點：模糊匹配 ===
     mode = st.radio("模式", ["Spot (正股)", "Options (期權)"], index=1)
     
-    # 這裡 iv_val 必須要有預設值，否則沒進 if 會報錯
     iv_val = 0.3 
-    
-    # 只要 "Options" 這個字在選項裡，就顯示拉桿
     if "Options" in mode:
-        st.success("✅ 已啟用期權模式")
-        iv_val = st.slider("IV (引伸波幅)", 0.1, 1.0, 0.25, step=0.05, help="數值越高，期權越貴，損耗越快")
+        st.success("✅ 期權模式 (時間值+IV模擬)")
+        iv_val = st.slider("IV (引伸波幅)", 0.1, 1.0, 0.25, step=0.05)
     
     st.divider()
     
     ticker = st.text_input("代號", value="QQQ").upper()
     initial_cash = st.number_input("本金", value=100000)
-    start_date = st.date_input("開始日期", pd.to_datetime("2023-01-01"))
+    
+    # === 新增：日期範圍選擇 ===
+    st.subheader("🗓️ 選擇回測區間")
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        start_date = st.date_input("開始", pd.to_datetime("2023-01-01"))
+    with col_d2:
+        end_date = st.date_input("結束", datetime.today())
     
     st.divider()
     buy_thresh = st.slider("買入 (J <)", 0, 40, 20)
     sell_thresh = st.slider("賣出 (J >)", 60, 100, 80)
     
-    run_btn = st.button("🚀 執行", type="primary")
+    run_btn = st.button("🚀 執行回測", type="primary")
 
-st.title(f"⚖️ V20.1 - {mode.split()[0]} 回測系統")
+st.title(f"🗓️ V20.2 - {mode.split()[0]} 日子範圍版")
 
 if run_btn:
-    with st.spinner("計算中..."):
-        df_raw, real_sym = get_stooq_data(ticker)
-        
-        if df_raw is not None and not df_raw.empty:
-            df = calculate_indicators(df_raw)
-            df = generate_signals(df, buy_thresh, sell_thresh)
+    if start_date > end_date:
+        st.error("⚠️ 錯誤：開始日期不能晚於結束日期！")
+    else:
+        with st.spinner("計算中..."):
+            df_raw, real_sym = get_stooq_data(ticker)
             
-            final_val, ret, df_log, df_chart = run_backtest(df, initial_cash, start_date, mode, iv_val)
-            
-            if not df_chart.empty:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("標的", real_sym)
-                c2.metric("最終資產", f"${final_val:,.0f}", f"{ret:+.2f}%")
+            if df_raw is not None and not df_raw.empty:
+                df = calculate_indicators(df_raw)
+                df = generate_signals(df, buy_thresh, sell_thresh)
                 
-                win_rate = 0
-                if not df_log.empty:
-                    closed = df_log.dropna(subset=['盈虧 ($)'])
-                    if len(closed) > 0:
-                        wins = len(closed[closed['盈虧 ($)'] > 0])
-                        win_rate = (wins / len(closed)) * 100
-                c3.metric("勝率", f"{win_rate:.1f}%", f"共 {len(df_log)} 筆")
+                # 傳入 end_date
+                final_val, ret, df_log, df_chart = run_backtest(df, initial_cash, start_date, end_date, mode, iv_val)
                 
-                st.subheader("資產走勢")
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4])
-                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], fill='tozeroy', line=dict(color='#00ff00'), name='資產'), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['J'], line=dict(color='#ab63fa'), name='J線'), row=2, col=1)
-                fig.add_hline(y=buy_thresh, line_dash="dot", row=2, col=1, line_color="green")
-                fig.add_hline(y=sell_thresh, line_dash="dot", row=2, col=1, line_color="red")
-                fig.update_layout(height=600, template="plotly_dark", showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.subheader("交易紀錄")
-                if not df_log.empty:
-                    disp = df_log.copy()
-                    disp['進場日期'] = disp['進場日期'].dt.date
-                    disp['出場日期'] = pd.to_datetime(disp['出場日期']).dt.date
-                    def color_row(val):
-                        if pd.isna(val): return ''
-                        return 'color: lightgreen' if val > 0 else 'color: #ff5555'
-                    st.dataframe(disp.style.format({"進場價(標的)": "{:.2f}", "出場價(標的)": "{:.2f}", "盈虧 ($)": "{:+.2f}", "報酬率 (%)": "{:+.2f}%"}).map(color_row, subset=['盈虧 ($)', '報酬率 (%)']), use_container_width=True)
-        else:
-            st.error("無法下載數據")
+                if not df_chart.empty:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("標的", real_sym)
+                    c2.metric("最終資產", f"${final_val:,.0f}", f"{ret:+.2f}%")
+                    
+                    win_rate = 0
+                    if not df_log.empty:
+                        closed = df_log.dropna(subset=['盈虧 ($)'])
+                        if len(closed) > 0:
+                            wins = len(closed[closed['盈虧 ($)'] > 0])
+                            win_rate = (wins / len(closed)) * 100
+                    c3.metric("勝率", f"{win_rate:.1f}%", f"共 {len(df_log)} 筆")
+                    
+                    st.subheader("資產走勢")
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4])
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], fill='tozeroy', line=dict(color='#00ff00' if 'Spot' in mode else '#ffaa00'), name='資產'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['J'], line=dict(color='#ab63fa'), name='J線'), row=2, col=1)
+                    fig.add_hline(y=buy_thresh, line_dash="dot", row=2, col=1, line_color="green")
+                    fig.add_hline(y=sell_thresh, line_dash="dot", row=2, col=1, line_color="red")
+                    fig.update_layout(height=600, template="plotly_dark", showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.subheader("交易紀錄")
+                    if not df_log.empty:
+                        disp = df_log.copy()
+                        disp['進場日期'] = disp['進場日期'].dt.date
+                        disp['出場日期'] = pd.to_datetime(disp['出場日期']).dt.date
+                        def color_row(val):
+                            if pd.isna(val): return ''
+                            return 'color: lightgreen' if val > 0 else 'color: #ff5555'
+                        st.dataframe(disp.style.format({"進場價(標的)": "{:.2f}", "出場價(標的)": "{:.2f}", "盈虧 ($)": "{:+.2f}", "報酬率 (%)": "{:+.2f}%"}).map(color_row, subset=['盈虧 ($)', '報酬率 (%)']), use_container_width=True)
+            else:
+                st.warning(f"在 {start_date} 到 {end_date} 之間沒有數據。")
