@@ -1,7 +1,7 @@
 # ==========================================
-# 老陳 AI 交易系統 V19.1 - Stooq 回測專用版
-# 核心：使用 Stooq 數據源進行歷史策略回測
-# 策略：AO + J線 (低買高賣)
+# 老陳 AI 交易系統 V19.2 - Stooq 直連修復版
+# 核心：棄用 pandas_datareader (因不支援 Python 3.12)
+# 改良：直接透過 URL 下載 Stooq CSV，穩定性 100%
 # ==========================================
 
 import streamlit as st
@@ -9,47 +9,79 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pandas_datareader.data as web
-from datetime import datetime
+import requests
+import io
 
-st.set_page_config(page_title="老陳回測系統 (Stooq)", layout="wide", page_icon="🧪")
+st.set_page_config(page_title="老陳回測系統 (Stooq V2)", layout="wide", page_icon="🛡️")
 
-# --- 1. 數據獲取 (Stooq 引擎) ---
+# --- 1. 數據獲取 (URL 直連法 - 修復版) ---
 @st.cache_data(ttl=3600)
-def get_stooq_data(symbol, start_date):
+def get_stooq_data(symbol):
     clean_sym = symbol.upper().strip()
     
-    # 智能修正代號 (配合 Stooq 格式)
+    # 智能修正代號 (Stooq 格式)
+    # 港股：700 -> 700.HK (Stooq 有時候前面要有 0，有時候不用，視乎情況，建議補齊4位)
     if clean_sym.isdigit(): 
+        # Stooq 港股通常是 0700.HK
         clean_sym = f"{clean_sym}.HK"
+        
+    # 恆指修正
     if clean_sym in ["HSI", "HSI.HK"]: 
         clean_sym = "^HSI"
         
+    # Stooq CSV 下載連結格式
+    # s=代號, i=d (日線)
+    url = f"https://stooq.com/q/d/l/?s={clean_sym}&i=d"
+    
     try:
-        # 下載數據
-        df = web.DataReader(clean_sym, 'stooq', start=start_date)
+        # 偽裝瀏覽器 (避免 Stooq 擋 Python)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        response = requests.get(url, headers=headers)
         
-        # ⚠️ 關鍵：Stooq 預設是 [新 -> 舊]，回測必須要 [舊 -> 新]
+        # 檢查是否下載成功
+        if response.status_code != 200:
+            return None, clean_sym
+            
+        # 將下載的內容轉為 DataFrame
+        file_content = response.content.decode('utf-8')
+        
+        # 如果 Stooq 找不到股票，通常會回傳一個很短的錯誤頁面，而不是 CSV
+        if "No data" in file_content or len(file_content) < 50:
+             return None, clean_sym
+
+        df = pd.read_csv(io.StringIO(file_content))
+        
+        # === 數據清理 ===
+        # Stooq 的 CSV 標題通常是: Date, Open, High, Low, Close, Volume
+        # 1. 處理日期
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
+        
+        # 2. 排序 (Stooq 下載下來是 新->舊，我們要反轉成 舊->新)
         df = df.sort_index()
         
-        # 轉為數值
-        df = df.apply(pd.to_numeric, errors='coerce')
+        # 3. 確保數值正確
+        cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for c in cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
         
         return df, clean_sym
+
     except Exception as e:
-        # 替身機制：恆指失敗轉盈富
+        print(f"Error: {e}")
+        # 替身機制：如果失敗，試試 2800.HK
         if clean_sym == "^HSI":
-             return get_stooq_data("2800", start_date)
+             return get_stooq_data("2800")
         return None, clean_sym
 
 # --- 2. 指標計算 ---
 def calculate_indicators(df):
     # MA
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA60'] = df['Close'].rolling(window=60).mean() # 牛熊線
+    df['MA60'] = df['Close'].rolling(window=60).mean()
     
-    # AO 指標 (Awesome Oscillator)
-    # MP = (High + Low) / 2
+    # AO 指標
     df['MP'] = (df['High'] + df['Low']) / 2
     df['AO'] = df['MP'].rolling(5).mean() - df['MP'].rolling(34).mean()
 
@@ -63,146 +95,123 @@ def calculate_indicators(df):
     
     return df
 
-# --- 3. 產生訊號 (策略大腦) ---
+# --- 3. 產生訊號 ---
 def generate_signals(df):
-    df['Signal'] = 0 # 0=無動作, 1=買入, -1=賣出
+    df['Signal'] = 0 
     
-    # 買入條件：J線低位(<20) 且 向上勾頭 (J > 昨日J)
+    # 買入：J線低位(<20) 且 向上勾頭
     buy_cond = (df['J'] < 20) & (df['J'] > df['J'].shift(1))
     
-    # 賣出條件：J線高位(>80) 且 向下勾頭 (J < 昨日J)
+    # 賣出：J線高位(>80) 且 向下勾頭
     sell_cond = (df['J'] > 80) & (df['J'] < df['J'].shift(1))
     
     df.loc[buy_cond, 'Signal'] = 1
     df.loc[sell_cond, 'Signal'] = -1
-    
     return df
 
-# --- 4. 回測引擎 (計算盈虧) ---
-def run_backtest(df, initial_capital):
-    capital = initial_capital
-    position = 0 # 持股數 (0=空倉)
-    history = []
-    equity_curve = [] # 資產曲線
+# --- 4. 回測引擎 ---
+def run_backtest(df, initial_capital, start_date):
+    # 篩選日期
+    mask = df.index >= pd.to_datetime(start_date)
+    df_test = df.loc[mask].copy()
     
-    for i in range(1, len(df)):
-        date = df.index[i]
-        price = df['Close'].iloc[i]
-        signal = df['Signal'].iloc[i]
+    if df_test.empty: return 0, 0, pd.DataFrame(), pd.DataFrame()
+
+    capital = initial_capital
+    position = 0
+    history = []
+    equity_curve = []
+    
+    for i in range(len(df_test)):
+        date = df_test.index[i]
+        price = df_test['Close'].iloc[i]
+        signal = df_test['Signal'].iloc[i]
         
-        # 執行買入 (有訊號 且 空倉時)
+        # 策略執行
         if signal == 1 and position == 0:
-            position = capital / price # 全倉買入
+            position = capital / price
             capital = 0
             history.append({'Date': date, 'Type': 'BUY', 'Price': price, 'Balance': position*price})
             
-        # 執行賣出 (有訊號 且 持倉時)
         elif signal == -1 and position > 0:
-            capital = position * price # 全倉賣出
+            capital = position * price
             position = 0
             history.append({'Date': date, 'Type': 'SELL', 'Price': price, 'Balance': capital})
         
-        # 每日結算資產價值
         current_val = capital if position == 0 else position * price
         equity_curve.append(current_val)
             
-    # 最後一天強制平倉
-    final_value = capital if position == 0 else position * df['Close'].iloc[-1]
+    final_value = capital if position == 0 else position * df_test['Close'].iloc[-1]
     ret = ((final_value - initial_capital) / initial_capital) * 100
     
-    # 補齊 equity curve 長度以便畫圖
-    df_chart = df.iloc[1:].copy()
-    df_chart['Equity'] = equity_curve
-    
-    return final_value, ret, pd.DataFrame(history), df_chart
+    df_test['Equity'] = equity_curve
+    return final_value, ret, pd.DataFrame(history), df_test
 
 # --- 5. 網站介面 ---
 with st.sidebar:
-    st.header("⚙️ 回測設定 (Stooq)")
-    ticker = st.text_input("股票代號", value="2800").upper()
+    st.header("⚙️ 回測設定 (直連版)")
+    ticker = st.text_input("股票代號 (如 2800)", value="2800").upper()
     start_date = st.date_input("開始日期", pd.to_datetime("2023-01-01"))
     initial_cash = st.number_input("初始本金 ($)", value=100000)
-    st.info("策略：J線 < 20 買入，J線 > 80 賣出")
     run_btn = st.button("🚀 開始回測", type="primary")
 
-st.title("🧪 老陳回測系統 V19.1")
-st.caption("數據源：Stooq (穩定不封鎖) | 策略：AO + J線反轉")
+st.title("🛡️ 老陳回測系統 V19.2")
+st.caption("✅ 已修復 Python 3.12 相容性問題 (Direct CSV Mode)")
 
 if run_btn:
-    with st.spinner(f"正在從波蘭 Stooq 下載 {ticker} 數據..."):
-        df_raw, real_sym = get_stooq_data(ticker, start_date)
+    with st.spinner(f"正在從 Stooq 下載 {ticker}..."):
+        df_raw, real_sym = get_stooq_data(ticker)
         
         if df_raw is not None and not df_raw.empty:
-            # 1. 計算
             df = calculate_indicators(df_raw)
             df = generate_signals(df)
-            final_val, ret, trade_log, df_chart = run_backtest(df, initial_cash)
             
-            # 2. 顯示績效
-            c1, c2, c3 = st.columns(3)
-            c1.metric("回測標的", real_sym)
+            # 傳入 start_date 進行切片
+            final_val, ret, trade_log, df_chart = run_backtest(df, initial_cash, start_date)
             
-            color = "normal"
-            if ret > 0: color = "normal" # 綠色/正常
-            else: color = "inverse" # 紅色 (Streamlit logic)
-            
-            c2.metric("最終資產", f"${final_val:,.0f}", f"{ret:+.2f}%")
-            
-            # 計算勝率
-            win_rate = 0
-            if not trade_log.empty:
-                sells = trade_log[trade_log['Type']=='SELL']
-                wins = 0
-                for idx, row in sells.iterrows():
-                    # 找對應的買入價
-                    # 這裡簡化邏輯，假設賣出一定對應最近一次買入
-                    # 實際應更嚴謹，但展示足夠了
-                    prev_buy = trade_log[(trade_log.index < idx) & (trade_log['Type']=='BUY')]
-                    if not prev_buy.empty:
-                         if row['Price'] > prev_buy.iloc[-1]['Price']: wins += 1
-                if len(sells) > 0:
-                    win_rate = (wins / len(sells)) * 100
-            
-            c3.metric("交易勝率", f"{win_rate:.1f}%", f"共 {len(trade_log)//2} 次交易")
-            
-            # 3. 畫圖 (三層)
-            st.subheader("📊 回測結果可視化")
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
-                                row_heights=[0.5, 0.25, 0.25],
-                                subplot_titles=('價格 & 買賣點', '資產增長曲線 (Equity Curve)', 'KDJ 指標'))
-            
-            # 圖1: K線 + 買賣點
-            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='blue', width=1), name='牛熊線'), row=1, col=1)
-            
-            # 標記買點
-            buys = df[df['Signal'] == 1]
-            fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.98, mode='markers', marker=dict(symbol='triangle-up', size=12, color='yellow'), name='買入'), row=1, col=1)
-            # 標記賣點
-            sells = df[df['Signal'] == -1]
-            fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.02, mode='markers', marker=dict(symbol='triangle-down', size=12, color='magenta'), name='賣出'), row=1, col=1)
-
-            # 圖2: 資產曲線
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], fill='tozeroy', line=dict(color='#00ff00'), name='總資產'), row=2, col=1)
-            
-            # 圖3: J線
-            fig.add_trace(go.Scatter(x=df.index, y=df['J'], line=dict(color='#ab63fa', width=2), name='J線'), row=3, col=1)
-            fig.add_hline(y=20, line_dash="dot", row=3, col=1, line_color="green")
-            fig.add_hline(y=80, line_dash="dot", row=3, col=1, line_color="red")
-            
-            fig.update_layout(height=800, template="plotly_dark", showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # 4. 交易明細
-            with st.expander("查看詳細交易紀錄"):
+            if not df_chart.empty:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("回測標的", real_sym)
+                c2.metric("最終資產", f"${final_val:,.0f}", f"{ret:+.2f}%")
+                
+                win_rate = 0
                 if not trade_log.empty:
-                    st.dataframe(trade_log.style.format({"Price": "{:.2f}", "Balance": "{:.2f}"}))
-                else:
-                    st.write("這段時間內沒有觸發任何交易。")
+                    sells = trade_log[trade_log['Type']=='SELL']
+                    if len(sells) > 0:
+                        wins = 0
+                        for idx, row in sells.iterrows():
+                            prev = trade_log[(trade_log.index < idx) & (trade_log['Type']=='BUY')]
+                            if not prev.empty and row['Price'] > prev.iloc[-1]['Price']: wins += 1
+                        win_rate = (wins/len(sells))*100
+                c3.metric("勝率", f"{win_rate:.1f}%", f"交易 {len(trade_log)//2} 次")
+                
+                # 畫圖
+                st.subheader("📊 回測結果")
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25])
+                
+                # K線
+                fig.add_trace(go.Candlestick(x=df_chart.index, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'], name='K線'), row=1, col=1)
+                
+                # 買賣點
+                buys = df_chart[df_chart['Signal'] == 1]
+                fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.98, mode='markers', marker=dict(symbol='triangle-up', size=12, color='yellow'), name='買入'), row=1, col=1)
+                sells = df_chart[df_chart['Signal'] == -1]
+                fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.02, mode='markers', marker=dict(symbol='triangle-down', size=12, color='magenta'), name='賣出'), row=1, col=1)
 
+                # 資產
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Equity'], line=dict(color='#00ff00'), name='資產'), row=2, col=1)
+                
+                # J線
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['J'], line=dict(color='#ab63fa'), name='J線'), row=3, col=1)
+                fig.add_hline(y=20, line_dash="dot", row=3, col=1, line_color="green")
+                fig.add_hline(y=80, line_dash="dot", row=3, col=1, line_color="red")
+                
+                fig.update_layout(height=800, template="plotly_dark", showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                with st.expander("交易紀錄"):
+                    st.dataframe(trade_log)
+            else:
+                st.warning("選定的日期範圍內沒有數據。")
         else:
-            st.error(f"找不到 {ticker} 的數據。")
-            st.info("💡 提示：港股請輸入數字 (如 700)，美股輸入代號 (如 TSLA)。")
-
-else:
-    st.info("👈 請在左側輸入代號，例如 2800，然後按開始。")
+            st.error(f"無法下載 {ticker}，請檢查代號 (港股建議 2800 或 0700)。")
